@@ -1,0 +1,21 @@
+{
+  "name": "anthropen-proxy",
+  "version": "1.0.0",
+  "description": "Anthropic Messages API -> OpenAI Chat Completions proxy for local LLMs (works with Claude Code)",
+  "type": "module",
+  "main": "index.js",
+  "bin": {
+    "anthropic-proxy": "index.js"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "test": "node --test \"test/*.test.js\""
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "fastify": "^5.12.5"
+  }
+}
