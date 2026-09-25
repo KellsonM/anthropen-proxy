@@ -2,12 +2,7 @@
 // calling an OpenAI-compatible backend on the back.
 
 import Fastify from 'fastify'
-import {
-  anthropicToOpenAI,
-  openaiToAnthropic,
-  estimateTokens,
-  badRequest,
-} from './mappers.js'
+import { anthropicToOpenAI, openaiToAnthropic, estimateRequestTokens } from './mappers.js'
 import { AnthropicStreamTranslator } from './stream.js'
 
 // Anthropic-shaped error body.
@@ -51,6 +46,7 @@ export function buildServer(config) {
         includeStreamUsage: config.streamUsage,
         bypassAppDetailMessage: config.bypassAppDetailMessage,
         includeTopK: config.topK ?? true,
+        warn: (msg) => dbg(request.log, msg),
       })
     } catch (err) {
       const status = err.status ?? 400
@@ -115,8 +111,21 @@ export function buildServer(config) {
     if (!openaiPayload.stream) {
       let data
       try {
-        data = await upstream.json()
+        // Read the body in chunks so the inactivity timer resets on every
+        // arriving byte: a slow-but-active download survives, only a
+        // stalled one aborts (same semantics as the streaming path).
+        const reader = upstream.body.getReader()
+        const decoder = new TextDecoder('utf-8')
+        let text = ''
+        while (true) {
+          const { value, done } = await reader.read()
+          if (done) break
+          resetTimer()
+          text += decoder.decode(value, { stream: true })
+        }
+        text += decoder.decode()
         clearTimer()
+        data = JSON.parse(text)
       } catch (err) {
         clearTimer()
         if (err.name === 'AbortError') {
@@ -133,14 +142,12 @@ export function buildServer(config) {
       }
       let anthropicResponse
       try {
-        anthropicResponse = openaiToAnthropic(
-          data,
-          openaiPayload.model,
-          // Serialize the request only when the backend actually omitted
+        anthropicResponse = openaiToAnthropic(data, openaiPayload.model, {
+          // Estimate the request only when the backend actually omitted
           // usage; the fallback estimate is the sole consumer.
-          data.usage ? '' : JSON.stringify(openaiPayload.messages),
-          { warn: (msg) => dbg(request.log, msg) },
-        )
+          inputTokens: data.usage ? 0 : estimateRequestTokens(payload),
+          warn: (msg) => dbg(request.log, msg),
+        })
       } catch (err) {
         const status = err.status ?? 502
         return reply
@@ -165,26 +172,49 @@ export function buildServer(config) {
       'X-Accel-Buffering': 'no',
     })
 
+    let clientGone = false
+    // Resolved when the socket drains (or dies) after a write returned
+    // false; the read loop awaits it so a slow client throttles upstream
+    // reads instead of letting frames buffer in memory without bound.
+    let drainWait = null
+    const waitForDrain = () => {
+      if (drainWait) return drainWait
+      drainWait = new Promise((resolve) => {
+        const done = () => {
+          drainWait = null
+          resolve()
+        }
+        raw.once('drain', done)
+        raw.once('close', done)
+      })
+      return drainWait
+    }
+
     const translator = new AnthropicStreamTranslator({
       model: openaiPayload.model,
+      inputTokens: estimateRequestTokens(payload),
       write: (event, data) => {
-        // Backpressure from a slow client is intentionally ignored: for a
-        // local proxy the frames buffer in memory until drained.
-        raw.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
+        if (clientGone) return
+        const ok = raw.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
         if (typeof raw.flush === 'function') raw.flush()
+        if (!ok) waitForDrain()
       },
     })
     translator.start()
 
     const reader = upstream.body.getReader()
     const decoder = new TextDecoder('utf-8')
-    let clientGone = false
+    // Listen on the *response* stream, not the request stream:
+    // IncomingMessage 'close' fires as soon as the request body has been
+    // consumed (before this handler registers), so it can never observe a
+    // mid-stream disconnect. ServerResponse 'close' fires when the socket
+    // actually terminates, including a client hanging up mid-response.
     const onClientClose = () => {
       clientGone = true
-      // Stop paying for generation the nobody is listening for.
+      // Stop paying for generation nobody is listening for.
       controller.abort()
     }
-    request.raw.on('close', onClientClose)
+    reply.raw.on('close', onClientClose)
 
     try {
       while (true) {
@@ -192,6 +222,7 @@ export function buildServer(config) {
         if (done) break
         resetTimer()
         translator.push(decoder.decode(value, { stream: true }))
+        if (drainWait) await drainWait
         if (translator.ended) {
           // Release the upstream connection promptly instead of leaving
           // the rest of the body unconsumed.
@@ -210,20 +241,18 @@ export function buildServer(config) {
       }
     } finally {
       clearTimer()
-      request.raw.removeListener('close', onClientClose)
+      reply.raw.removeListener('close', onClientClose)
       raw.end()
     }
   })
 
   // Token counting: clients only need a rough number for budgeting.
+  // Base64 payloads are stripped and images charged a fixed per-image
+  // cost, so a screenshot does not inflate the estimate by orders of
+  // magnitude and trigger premature auto-compaction.
   app.post('/v1/messages/count_tokens', async (request) => {
     const payload = request.body ?? {}
-    const text = JSON.stringify({
-      system: payload.system ?? '',
-      messages: payload.messages ?? [],
-      tools: payload.tools ?? [],
-    })
-    return { input_tokens: estimateTokens(text) }
+    return { input_tokens: estimateRequestTokens(payload) }
   })
 
   return app

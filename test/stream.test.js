@@ -318,3 +318,51 @@ test('length finish_reason maps to max_tokens in stream', () => {
   const md = events.find((e) => e.event === 'message_delta')
   assert.equal(md.data.delta.stop_reason, 'max_tokens')
 })
+
+// ---------------------------------------------------------------------------
+// translator: input token estimate
+// ---------------------------------------------------------------------------
+
+test('message_start carries the input token estimate', () => {
+  const events = []
+  const t = new AnthropicStreamTranslator({
+    model: 'test/model',
+    messageId: 'msg_test',
+    inputTokens: 123,
+    write: (event, data) => events.push({ event, data }),
+  })
+  t.start()
+  assert.equal(events[0].data.message.usage.input_tokens, 123)
+})
+
+test('message_delta usage fallback includes input_tokens', () => {
+  const events = []
+  const t = new AnthropicStreamTranslator({
+    model: 'test/model',
+    messageId: 'msg_test',
+    inputTokens: 77,
+    write: (event, data) => events.push({ event, data }),
+  })
+  t.start()
+  t.push(chunk({ content: 'some output' }))
+  t.push('data: [DONE]\n\n')
+  const md = events.find((e) => e.event === 'message_delta')
+  assert.equal(md.data.usage.input_tokens, 77)
+  assert.ok(md.data.usage.output_tokens > 0)
+})
+
+test('real usage chunk overrides the input estimate in message_delta', () => {
+  const events = []
+  const t = new AnthropicStreamTranslator({
+    model: 'test/model',
+    messageId: 'msg_test',
+    inputTokens: 999,
+    write: (event, data) => events.push({ event, data }),
+  })
+  t.start()
+  t.push(chunk({ content: 'hi' }))
+  t.push(`data: ${JSON.stringify({ choices: [], usage: { prompt_tokens: 5, completion_tokens: 2 } })}\n\n`)
+  t.push('data: [DONE]\n\n')
+  const md = events.find((e) => e.event === 'message_delta')
+  assert.deepEqual(md.data.usage, { input_tokens: 5, output_tokens: 2 })
+})

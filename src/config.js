@@ -1,10 +1,13 @@
 // Configuration resolution: CLI flags override environment variables,
 // which override built-in defaults.
 
-export const HELP = `anthropic-proxy — Anthropic Messages API -> OpenAI Chat Completions proxy
+// Boolean env vars accept "1" or "true"; anything else is off.
+const truthy = (v) => v === '1' || v === 'true'
+
+export const HELP = `anthropen-proxy — Anthropic Messages API -> OpenAI Chat Completions proxy
 
 Usage:
-  anthropic-proxy [options]
+  anthropen-proxy [options]
   ANTHROPIC_PROXY_BASE_URL=http://localhost:11434/v1 node index.js
 
 Options (env var in parentheses):
@@ -15,6 +18,7 @@ Options (env var in parentheses):
   --api-key <key>             Backend API key, sent as Bearer token
                               (OPENROUTER_API_KEY / ANTHROPIC_PROXY_API_KEY, optional)
   --model <name>              Default model for normal requests
+  --completion-model <name>   Alias for --model
                               (COMPLETION_MODEL / MODEL, default qwen2.5-coder:7b)
   --reasoning-model <name>    Model used when the request enables thinking
                               (REASONING_MODEL, defaults to --model)
@@ -78,9 +82,7 @@ export function resolveConfig(argv = [], env = process.env) {
     .filter(Boolean)
 
   const streamUsage =
-    flags.streamUsage !== undefined
-      ? flags.streamUsage
-      : !(env.DISABLE_STREAM_USAGE === '1' || env.DISABLE_STREAM_USAGE === 'true')
+    flags.streamUsage !== undefined ? flags.streamUsage : !truthy(env.DISABLE_STREAM_USAGE)
 
   const port = flags.port ?? Number(env.PORT ?? 3000)
   if (!Number.isInteger(port) || port < 0 || port > 65535) {
@@ -100,16 +102,15 @@ export function resolveConfig(argv = [], env = process.env) {
     host: flags.host ?? env.HOST ?? '127.0.0.1',
     port,
     timeout: timeoutSec * 1000,
-    topK: flags.topK ?? !(env.DISABLE_TOP_K === '1' || env.DISABLE_TOP_K === 'true'),
+    topK: flags.topK ?? !truthy(env.DISABLE_TOP_K),
     baseUrl: (flags.baseUrl ?? env.ANTHROPIC_PROXY_BASE_URL ?? 'http://localhost:11434/v1')
       .replace(/\/+$/, ''),
     apiKey: flags.apiKey ?? env.ANTHROPIC_PROXY_API_KEY ?? env.OPENROUTER_API_KEY ?? null,
     models: { completion: completionModel, reasoning: reasoningModel },
     filterTools,
     streamUsage,
-    bypassAppDetailMessage:
-      flags.bypassAppDetailMessage ?? (env.BYPASS_APP_DETAIL_MESSAGE === '1' || env.BYPASS_APP_DETAIL_MESSAGE === 'true'),
-    debug: flags.debug ?? (env.DEBUG === '1' || env.DEBUG === 'true'),
+    bypassAppDetailMessage: flags.bypassAppDetailMessage ?? truthy(env.BYPASS_APP_DETAIL_MESSAGE),
+    debug: flags.debug ?? truthy(env.DEBUG),
     help: flags.help === true,
   }
 }

@@ -10,6 +10,8 @@ import {
   mapStopReason,
   convertMessage,
   estimateTokens,
+  estimateRequestTokens,
+  IMAGE_TOKEN_ESTIMATE,
 } from '../src/mappers.js'
 
 const MODELS = { completion: 'test/completion', reasoning: 'test/reasoning' }
@@ -373,11 +375,20 @@ test('usage falls back to estimate when absent', () => {
   const out = openaiToAnthropic(
     { choices: [{ message: { content: 'hello world' }, finish_reason: 'stop' }] },
     'm',
-    'some input text here',
+    { inputTokens: estimateTokens('some input text here') },
   )
   assert.ok(out.usage.input_tokens > 0)
   assert.ok(out.usage.output_tokens > 0)
   assert.equal(estimateTokens(''), 0)
+})
+
+test('openaiToAnthropic accepts inputTokens option directly', () => {
+  const out = openaiToAnthropic(
+    { choices: [{ message: { content: 'x' }, finish_reason: 'stop' }] },
+    'm',
+    { inputTokens: 42 },
+  )
+  assert.equal(out.usage.input_tokens, 42)
 })
 
 test('response with no choices throws', () => {
@@ -556,9 +567,96 @@ test('malformed tool args trigger the warn callback', () => {
       ],
     },
     'm',
-    '',
     { warn: (m) => warnings.push(m) },
   )
   assert.equal(warnings.length, 1)
   assert.deepEqual(out.content[0].input, {})
+})
+
+// ---------------------------------------------------------------------------
+// tool_result is_error surfacing
+// ---------------------------------------------------------------------------
+
+test('tool_result is_error gets an [error] prefix', () => {
+  const out = convertMessage({
+    role: 'user',
+    content: [{ type: 'tool_result', tool_use_id: 't1', content: 'boom', is_error: true }],
+  })
+  assert.equal(out[0].role, 'tool')
+  assert.equal(out[0].content, '[error] boom')
+})
+
+test('tool_result without is_error is unchanged', () => {
+  const out = convertMessage({
+    role: 'user',
+    content: [{ type: 'tool_result', tool_use_id: 't1', content: 'fine' }],
+  })
+  assert.equal(out[0].content, 'fine')
+})
+
+// ---------------------------------------------------------------------------
+// estimateRequestTokens (count_tokens)
+// ---------------------------------------------------------------------------
+
+test('estimateRequestTokens strips base64 and charges fixed per-image cost', () => {
+  const bigBase64 = 'A'.repeat(200_000)
+  const t = estimateRequestTokens({
+    system: 'sys prompt',
+    messages: [
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'see image' },
+          { type: 'image', source: { type: 'base64', media_type: 'image/png', data: bigBase64 } },
+        ],
+      },
+    ],
+  })
+  // Text portion is tiny; the 200k base64 blob must NOT be counted as text.
+  assert.ok(t >= IMAGE_TOKEN_ESTIMATE, `expected >= ${IMAGE_TOKEN_ESTIMATE}, got ${t}`)
+  assert.ok(t < IMAGE_TOKEN_ESTIMATE + 100, `text portion leaked into estimate: ${t}`)
+})
+
+test('estimateRequestTokens counts multiple images', () => {
+  const img = { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'B'.repeat(1000) } }
+  const t = estimateRequestTokens({ messages: [{ role: 'user', content: [img, img, img] }] })
+  assert.ok(t >= 3 * IMAGE_TOKEN_ESTIMATE)
+  assert.ok(t < 3 * IMAGE_TOKEN_ESTIMATE + 100)
+})
+
+test('estimateRequestTokens handles empty/missing payload', () => {
+  assert.ok(Number.isFinite(estimateRequestTokens({})))
+  assert.ok(Number.isFinite(estimateRequestTokens(undefined)))
+})
+
+// ---------------------------------------------------------------------------
+// tool_choice dangling reference
+// ---------------------------------------------------------------------------
+
+test('tool_choice referencing a filtered tool is dropped with a warning', () => {
+  const warnings = []
+  const out = anthropicToOpenAI(
+    base({
+      tools: [{ name: 'BatchTool', description: 'd', input_schema: { type: 'object' } }],
+      tool_choice: { type: 'tool', name: 'BatchTool' },
+    }),
+    { models: MODELS, filterToolNames: ['BatchTool'], warn: (m) => warnings.push(m) },
+  )
+  assert.equal(out.tools, undefined)
+  assert.equal(out.tool_choice, undefined)
+  assert.equal(warnings.length, 1)
+  assert.match(warnings[0], /BatchTool/)
+})
+
+test('tool_choice naming a forwarded tool is kept', () => {
+  const warnings = []
+  const out = anthropicToOpenAI(
+    base({
+      tools: [{ name: 'Read', description: 'd', input_schema: { type: 'object' } }],
+      tool_choice: { type: 'tool', name: 'Read' },
+    }),
+    { models: MODELS, warn: (m) => warnings.push(m) },
+  )
+  assert.deepEqual(out.tool_choice, { type: 'function', function: { name: 'Read' } })
+  assert.equal(warnings.length, 0)
 })

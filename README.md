@@ -1,4 +1,4 @@
-# anthropic-proxy
+# anthropen-proxy
 
 A translation layer that converts the **Anthropic Messages API** (the front-end protocol used by clients such as Claude Code) into the **OpenAI Chat Completions API** (a local LLM backend).
 
@@ -10,8 +10,9 @@ No changes are needed on the front end: Claude Code / the Anthropic SDK keeps ca
 - **Streaming SSE conversion**: OpenAI chunk stream → Anthropic event stream (`message_start` / `content_block_*` / `message_delta` / `message_stop`), correctly handling block-index switching and interleaving of text, thinking, and tool calls
 - **Thinking-model routing**: requests carrying `thinking` are automatically switched to the reasoning model; `reasoning` / `reasoning_content` deltas are mapped to Anthropic `thinking_delta`
 - **Error conversion**: upstream errors are mapped to the standard Anthropic error format (`authentication_error` / `rate_limit_error` / `api_error`, etc.)
-- **Auxiliary endpoints**: `/v1/messages/count_tokens` (token estimation), `/health`
-- **102 automated tests**: unit tests + end-to-end integration tests (`npm test`)
+- **Auxiliary endpoints**: `/v1/messages/count_tokens` (token estimation; base64 images are charged a fixed ~1600 tokens each instead of their encoded size), `/health`
+- **Robust streaming**: true inactivity timeout on both streaming and non-streaming paths, drain-based backpressure for slow clients, and immediate upstream cancellation when the client disconnects mid-stream
+- **116 automated tests**: unit tests + end-to-end integration tests (`npm test`)
 
 ## Installation
 
@@ -69,12 +70,12 @@ Command-line arguments take precedence over environment variables, which take pr
 | `--port` | `PORT` | `3000` | Listen port |
 | `--base-url` | `ANTHROPIC_PROXY_BASE_URL` | `http://localhost:11434/v1` | OpenAI-compatible backend base URL (without `/chat/completions`) |
 | `--api-key` | `OPENROUTER_API_KEY` / `ANTHROPIC_PROXY_API_KEY` | none | Backend Bearer key; no Authorization header is sent if unset |
-| `--model` | `COMPLETION_MODEL` / `MODEL` | `qwen2.5-coder:7b` | Model used for regular requests |
+| `--model` (alias `--completion-model`) | `COMPLETION_MODEL` / `MODEL` | `qwen2.5-coder:7b` | Model used for regular requests |
 | `--reasoning-model` | `REASONING_MODEL` | same as `--model` | Model used when the request carries `thinking` |
 | `--filter-tools` | `FILTER_TOOLS` | `BatchTool` | Comma-separated tool names to drop before forwarding |
 | — | `DISABLE_STREAM_USAGE=1` | off | Do not send `stream_options.include_usage` (for strict backends) |
 | `--bypass-app-detail-message` | `BYPASS_APP_DETAIL_MESSAGE=1` | off | During conversion, drop the single message in the `messages` array whose `role: "system"` content contains `<application_details>`; all other messages are unaffected |
-| `--timeout <seconds>` | `UPSTREAM_TIMEOUT` | `600` | Upstream inactivity timeout: abort with 504 when the backend sends no bytes for this long (no response, or a stalled stream) |
+| `--timeout <seconds>` | `UPSTREAM_TIMEOUT` | `600` | Upstream inactivity timeout: abort with 504 when the backend sends no bytes for this long. The timer resets on every received byte in both streaming and non-streaming paths, so a slow-but-active response is never killed |
 | `--no-top-k` | `DISABLE_TOP_K=1` | off | Do not forward `top_k` (strict OpenAI-compatible backends reject unknown fields with 400) |
 | `--debug` | `DEBUG=1` | off | Print the converted payload / logs |
 | `--help` | — | — | Help |
@@ -107,14 +108,14 @@ curl -s http://127.0.0.1:3000/v1/messages/count_tokens \
 npm test
 ```
 
-Coverage: request mapping (system merging, message role conversion, tools/tool results, sampling parameters, model routing, validation), SSE parsing (chunked line breaks, comments, CRLF), streaming block-index management (text/thinking/tool interleaving), error conversion, end-to-end integration (real HTTP + fake upstream).
+Coverage: request mapping (system merging, message role conversion, tools/tool results including `is_error` surfacing, sampling parameters, model routing, validation), SSE parsing (chunked line breaks, comments, CRLF), streaming block-index management (text/thinking/tool interleaving), error conversion, request-side token estimation (base64 stripping, fixed per-image cost), and end-to-end integration (real HTTP + fake upstream, including client-disconnect cancellation and inactivity-timeout semantics).
 
 ## Known Limitations
 
 - The quality of Anthropic-level tool calling with local models depends on the model itself; strong function-calling models such as Qwen2.5-Coder or DeepSeek-Coder are recommended
 - `document` (PDF) content blocks are replaced with a placeholder `[document: ...]` (the OpenAI protocol has no equivalent capability)
 - The `signature` of thinking blocks is an empty string (local models cannot sign; this does not affect Claude Code display)
-- Token counts are estimates (~1 char/token for CJK, ~4 chars/token otherwise), not exact tokenization
+- Token counts are estimates (~1 char/token for CJK, ~4 chars/token otherwise; images charged a fixed 1600 tokens each), not exact tokenization
 - In streaming, when a tool-call argument delta is interrupted by other content (e.g. reasoning) and then resumes, the original block index is reused for further deltas; strictly spec-compliant clients may reject "delta after block stop", though most real-world clients tolerate it (see TECHNICAL.md §2.3)
 
 For detailed protocol mapping rules, see [TECHNICAL.md](./TECHNICAL.md).

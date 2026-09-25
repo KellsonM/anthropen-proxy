@@ -5,7 +5,7 @@
   "type": "module",
   "main": "index.js",
   "bin": {
-    "anthropic-proxy": "index.js"
+    "anthropen-proxy": "index.js"
   },
   "scripts": {
     "start": "node index.js",

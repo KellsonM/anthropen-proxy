@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// anthropic-proxy entry point: parse CLI/env config, start the server.
+// anthropen-proxy entry point: parse CLI/env config, start the server.
 
 import { resolveConfig, HELP } from './src/config.js'
 import { buildServer } from './src/server.js'
@@ -19,10 +19,17 @@ if (config.help) {
 
 const app = buildServer(config)
 
+const LOOPBACK = new Set(['127.0.0.1', 'localhost', '::1'])
+
 const start = async () => {
   try {
     await app.listen({ host: config.host, port: config.port })
-    console.log(`anthropic-proxy listening on http://${config.host}:${config.port}`)
+    console.log(`anthropen-proxy listening on http://${config.host}:${config.port}`)
+    if (!LOOPBACK.has(config.host)) {
+      console.warn(
+        `⚠ binding to ${config.host}: this proxy has NO authentication — anyone who can reach this address can use your backend model.`,
+      )
+    }
     console.log(`  backend:  ${config.baseUrl}/chat/completions`)
     console.log(`  model:    ${config.models.completion}`)
     console.log(`  reasoning: ${config.models.reasoning}`)

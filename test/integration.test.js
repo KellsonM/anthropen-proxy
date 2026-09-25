@@ -491,6 +491,116 @@ test('e2e: non-streaming reasoning_content surfaces as thinking block', async ()
   assert.equal(body.content[1].type, 'text')
 })
 
+// ---------------------------------------------------------------------------
+// client disconnect & inactivity semantics
+// ---------------------------------------------------------------------------
+
+test('e2e: client disconnect mid-stream aborts the upstream request', async () => {
+  let upstreamAborted = false
+  let upstreamFinished = false
+  const upstream = await startFakeUpstream((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' })
+    let i = 0
+    const iv = setInterval(() => {
+      i++
+      res.write(
+        `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: 'tok' + i }, finish_reason: null }] })}\n\n`,
+      )
+      if (i >= 40) {
+        clearInterval(iv)
+        res.end('data: [DONE]\n\n')
+        upstreamFinished = true
+      }
+    }, 50)
+    res.on('close', () => {
+      if (!upstreamFinished) upstreamAborted = true
+      clearInterval(iv)
+    })
+  })
+  cleanups.push(() => upstream.close())
+  const proxy = await startProxy({ baseUrl: upstream.base })
+  cleanups.push(() => proxy.close())
+
+  const ac = new AbortController()
+  const res = await fetch(`${proxy.base}/v1/messages`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(anthropicBody({ stream: true })),
+    signal: ac.signal,
+  })
+  const reader = res.body.getReader()
+  await reader.read() // message_start arrives
+  await new Promise((r) => setTimeout(r, 150)) // let a few tokens flow
+  ac.abort() // client hangs up mid-stream
+  await new Promise((r) => setTimeout(r, 400))
+
+  assert.equal(upstreamAborted, true, 'upstream connection should be closed after client disconnect')
+  assert.equal(upstreamFinished, false, 'upstream should NOT have run to completion')
+})
+
+test('e2e: non-streaming slow-but-active download survives past the total timeout', async () => {
+  // Body trickles in 10-byte chunks every 60ms: total transfer (~800ms)
+  // exceeds the 250ms timeout, but every inter-byte gap is well under it.
+  // With true inactivity semantics the request must succeed.
+  const body = JSON.stringify({
+    choices: [{ message: { role: 'assistant', content: 'slow but steady' }, finish_reason: 'stop' }],
+    usage: { prompt_tokens: 2, completion_tokens: 3 },
+  })
+  const upstream = await startFakeUpstream((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    let i = 0
+    const iv = setInterval(() => {
+      res.write(body.slice(i, i + 10))
+      i += 10
+      if (i >= body.length) {
+        clearInterval(iv)
+        res.end()
+      }
+    }, 60)
+  })
+  cleanups.push(() => upstream.close())
+  const proxy = await startProxy({ baseUrl: upstream.base, timeout: 250 })
+  cleanups.push(() => proxy.close())
+
+  const res = await fetch(`${proxy.base}/v1/messages`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(anthropicBody()),
+  })
+  assert.equal(res.status, 200)
+  const out = await res.json()
+  assert.equal(out.content[0].text, 'slow but steady')
+})
+
+test('e2e: count_tokens does not count base64 image data as text', async () => {
+  const proxy = await startProxy({ baseUrl: 'http://127.0.0.1:1/v1' })
+  cleanups.push(() => proxy.close())
+
+  const bigBase64 = 'A'.repeat(200_000)
+  const res = await fetch(`${proxy.base}/v1/messages/count_tokens`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      max_tokens: 64,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'look at this screenshot' },
+            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: bigBase64 } },
+          ],
+        },
+      ],
+    }),
+  })
+  assert.equal(res.status, 200)
+  const body = await res.json()
+  // ~1600 for the image + a handful for the text; the 200k base64 blob
+  // would have added ~50k tokens under the old text-counting behavior.
+  assert.ok(body.input_tokens >= 1600, `expected >= 1600, got ${body.input_tokens}`)
+  assert.ok(body.input_tokens < 5000, `base64 leaked into estimate: ${body.input_tokens}`)
+})
+
 test('e2e: top_k forwarded by default, omitted when topK=false', async () => {
   let captured = null
   const upstream = await startFakeUpstream((req, res) => {

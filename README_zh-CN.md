@@ -1,4 +1,4 @@
-# anthropic-proxy
+# anthropen-proxy
 
 把 **Anthropic Messages API**（Claude Code 等客户端使用的前端协议）转换为 **OpenAI Chat Completions API**（本地大模型后端）的中间转换层。
 
@@ -10,8 +10,9 @@
 - **流式 SSE 转换**：OpenAI chunk 流 → Anthropic 事件流（`message_start` / `content_block_*` / `message_delta` / `message_stop`），正确处理文本、思考（thinking）、工具调用的块索引切换与交错
 - **思考模型路由**：请求带 `thinking` 时自动切换到 reasoning 模型，`reasoning` / `reasoning_content` 增量映射为 Anthropic `thinking_delta`
 - **错误转换**：上游错误映射为 Anthropic 标准错误格式（`authentication_error` / `rate_limit_error` / `api_error` 等）
-- **辅助端点**：`/v1/messages/count_tokens`（估算 token）、`/health`
-- **102 个自动化测试**：单元测试 + 端到端集成测试（`npm test`）
+- **辅助端点**：`/v1/messages/count_tokens`（估算 token；base64 图片按每张固定约 1600 token 计，而非按编码后的字符数）、`/health`
+- **健壮的流式处理**：流式与非流式路径均为真不活动超时、慢客户端 drain 背压、客户端中途断连时立即取消上游生成
+- **116 个自动化测试**：单元测试 + 端到端集成测试（`npm test`）
 
 ## 安装
 
@@ -69,12 +70,12 @@ claude
 | `--port` | `PORT` | `3000` | 监听端口 |
 | `--base-url` | `ANTHROPIC_PROXY_BASE_URL` | `http://localhost:11434/v1` | OpenAI 兼容后端 base URL（不含 `/chat/completions`） |
 | `--api-key` | `OPENROUTER_API_KEY` / `ANTHROPIC_PROXY_API_KEY` | 无 | 后端 Bearer key，不设置则不发送 Authorization 头 |
-| `--model` | `COMPLETION_MODEL` / `MODEL` | `qwen2.5-coder:7b` | 普通请求使用的模型 |
+| `--model`（别名 `--completion-model`） | `COMPLETION_MODEL` / `MODEL` | `qwen2.5-coder:7b` | 普通请求使用的模型 |
 | `--reasoning-model` | `REASONING_MODEL` | 同 `--model` | 请求带 `thinking` 时使用的模型 |
 | `--filter-tools` | `FILTER_TOOLS` | `BatchTool` | 逗号分隔，转发前丢弃的工具名 |
 | — | `DISABLE_STREAM_USAGE=1` | 关 | 不发送 `stream_options.include_usage`（兼容严格后端） |
 | `--bypass-app-detail-message` | `BYPASS_APP_DETAIL_MESSAGE=1` | 关 | 转换时丢弃 `messages` 数组中 `role: "system"` 且 content 包含 `<application_details>` 的单条消息，其余消息不受影响 |
-| `--timeout <秒>` | `UPSTREAM_TIMEOUT` | `600` | 上游不活动超时：后端超过该秒数无任何字节返回（未响应或流停滞）即中止并返回 504 |
+| `--timeout <秒>` | `UPSTREAM_TIMEOUT` | `600` | 上游不活动超时：后端超过该秒数无任何字节返回即中止并返回 504。流式与非流式路径均在每收到字节时重置计时器，慢速但持续的响应不会被误杀 |
 | `--no-top-k` | `DISABLE_TOP_K=1` | 关 | 不转发 `top_k`（严格 OpenAI 兼容后端会对未知字段返回 400） |
 | `--debug` | `DEBUG=1` | 关 | 打印转换后的 payload / 日志 |
 | `--help` | — | — | 帮助 |
@@ -107,14 +108,14 @@ curl -s http://127.0.0.1:3000/v1/messages/count_tokens \
 npm test
 ```
 
-覆盖：请求映射（system 合并、消息角色转换、工具/工具结果、采样参数、模型路由、校验）、SSE 解析（分块断行、注释、CRLF）、流式块索引管理（文本/思考/工具交错）、错误转换、端到端集成（真实 HTTP + 假上游）。
+覆盖：请求映射（system 合并、消息角色转换、工具/工具结果含 `is_error` 上报、采样参数、模型路由、校验）、SSE 解析（分块断行、注释、CRLF）、流式块索引管理（文本/思考/工具交错）、错误转换、请求侧 token 估算（base64 剔除、图片固定计费）、端到端集成（真实 HTTP + 假上游，含客户端断连取消与不活动超时语义）。
 
 ## 已知限制
 
 - 本地模型对 Anthropic 级工具调用质量取决于模型本身；建议用 Qwen2.5-Coder、DeepSeek-Coder 等强函数调用模型
 - `document`（PDF）内容块以占位符 `[document: ...]` 代替（OpenAI 协议无对应能力）
 - 思考块的 `signature` 为空字符串（本地模型无签名能力，不影响 Claude Code 显示）
-- token 计数为估算值（CJK 约 1 字/token、其余约 4 字符/token），非精确分词
+- token 计数为估算值（CJK 约 1 字/token、其余约 4 字符/token；图片按每张固定 1600 token 计），非精确分词
 - 流式下 tool 调用参数被其他内容（如 reasoning）打断后恢复时，会复用原块索引继续发 delta；严格遵循「块 stop 后不可重开」的客户端可能报错，多数实际客户端可容忍（详见 TECHNICAL_zh-CN.md §2.3）
 
 详细协议映射规则见 [TECHNICAL_zh-CN.md](./TECHNICAL_zh-CN.md)。

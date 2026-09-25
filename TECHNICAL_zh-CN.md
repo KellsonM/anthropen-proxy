@@ -87,7 +87,7 @@ POST /v1/chat/completions
 
 **工具映射**：`input_schema → parameters`，并递归剥离 `format:"uri"`（本地模型常见报错源）。`BatchTool` 等不可用工具按 `filterTools` 丢弃。
 
-**tool_choice**：`auto→auto`、`none→none`、`any→required`、`{type:'tool',name}→{type:'function',function:{name}}`。
+**tool_choice**：`auto→auto`、`none→none`、`any→required`、`{type:'tool',name}→{type:'function',function:{name}}`。若强制指定的工具不在转发的工具列表中（例如被 `filterTools` 丢弃），该 `tool_choice` 会被丢弃并通过 `warn` 诊断上报，而不是原样转发——后端不会收到悬空引用，客户端的工具循环也能从日志中得到明确原因而非静默死锁。
 
 **模型路由**：`thinking.type === 'enabled'` → `models.reasoning`，否则 `models.completion`。
 
@@ -100,12 +100,12 @@ POST /v1/chat/completions
 - `tool_calls[]` → `{type:'tool_use', id, name, input}` 块（arguments JSON 解析失败时降级为 `{}`，不中断响应；失败会通过 `warn` 回调上报，供 debug 日志记录）
 - `finish_reason` → `stop_reason`：`stop→end_turn`、`length→max_tokens`、`tool_calls→tool_use`、`content_filter→end_turn`
 - `id`：`chatcmpl-xxx → msg_xxx`；缺失时随机生成
-- `usage`：`prompt_tokens→input_tokens`、`completion_tokens→output_tokens`；缺失时估算（CJK 约 1 字/token、其余约 4 字符/token）
+- `usage`：`prompt_tokens→input_tokens`、`completion_tokens→output_tokens`；缺失时输入侧使用请求侧估算值（`estimateRequestTokens`：剔除 base64 数据、图片按每张固定 1600 token 计），输出侧按响应文本估算（CJK 约 1 字/token、其余约 4 字符/token）
 - 缺失 `choices` → 抛出 **502 `api_error`**（上游问题，而非客户端错误）
 
 ### 2.3 流式转换（`src/stream.js`）
 
-**SSEParser**：增量解析上游 SSE。处理任意字节偏移的断行、多行 `data:`、`:` 注释行（OpenRouter keep-alive）、CRLF。事件以空行分帧。
+**SSEParser**：增量解析上游 SSE。处理任意字节偏移的断行、多行 `data:`、`:` 注释行（OpenRouter keep-alive）、CRLF。事件以空行分帧。采用索引指针扫描，每次 `feed()` 只对残留尾部做一次切片，k 行 / n 字节缓冲的代价为 O(n) 而非 O(k·n)。
 
 **AnthropicStreamTranslator**：把 OpenAI delta 流重组为 Anthropic 事件序列。核心是**块索引状态机**：
 
@@ -133,7 +133,7 @@ POST /v1/chat/completions
 
 > **已知边界情况（场景 3）**：打断发生时工具块已被关闭，恢复时会对着已 stop 的索引继续发 `input_json_delta` 且不重发 `content_block_start`。严格来说这违反 Anthropic「块 stop 后不可重开」的规则；多数实际客户端可容忍，但严格遵循规范的客户端可能拒绝该流。正确的修复方向是把未完成的 tool 块延迟到消息结束再关闭。
 
-**usage 兜底**：上游未给 usage 时按已累积文本估算 output_tokens。
+**usage**：`message_start` 携带请求侧的输入 token 估算值（对齐真实 API 提前报告输入 token 的行为）。`message_delta` 在后端发送 usage chunk 时报告真实用量；否则回退为输入估算值加上按已累积文本估算的输出值。
 
 ### 2.4 服务器层（`src/server.js`）
 
@@ -141,10 +141,11 @@ POST /v1/chat/completions
 - 流式路径使用 `reply.hijack()` 接管原始 socket，直接写 SSE 帧（`event:` + `data:` + 空行），有 `flush` 即刷新，保证低延迟逐 token 输出
 - 上游不可达 → 502 `api_error`；上游 4xx/5xx → 按状态映射 Anthropic 错误类型（401/403→`authentication_error`、404→`not_found_error`、429→`rate_limit_error`）
 - 请求校验失败（缺 `max_tokens`、空 `messages`、非法 role）在调用上游**之前**返回 400
-- **上游不活动超时**（`--timeout`，默认 600s）：`AbortController` 计时器在每收到上游字节时重置；后端无响应或流停滞超过阈值即中止请求并返回 504 `api_error`
-- **客户端断连（流式）**：请求的 `close` 事件触发 `controller.abort()` 加 `reader.cancel()`，立即停止无人监听的上游生成并释放连接；socket `error` 事件被吞掉，死客户端永远不会拖垮进程
+- **上游不活动超时**（`--timeout`，默认 600s）：`AbortController` 计时器在每收到上游字节时重置——**流式与非流式路径皆然**（后者正是为此才分块读取响应体）。慢速但持续的响应不会被误杀，只有真正停滞的请求才以 504 `api_error` 中止
+- **客户端断连（流式）**：通过**响应流**（`reply.raw`）的 `close` 事件检测，它在 socket 真正终止时触发。刻意不使用请求流的 `close`：`IncomingMessage` 在请求体被读完时即触发该事件（早于 handler 注册监听器），因此永远观察不到流中途断开。真实断连发生时代理立即 abort 上游请求，停止无人监听的上游生成；socket `error` 事件被吞掉，死客户端永远不会拖垮进程
+- **背压**：向慢客户端写入返回 `false` 时，读取循环暂停直到 socket `drain`，帧因此节流上游而不是在内存中无界缓冲。若客户端永久卡死，上游字节停止到达，不活动计时器随之中止请求——两种机制自洽地组合在一起
 - **错误形状保证**：所有非流式的映射/解析异常（非法 JSON body → 502、缺 choices → 502 `api_error`、映射错误）都被捕获并以 Anthropic 错误格式返回——Fastify 默认错误格式永远不会泄漏给客户端
-- 仅当后端确实省略 `usage` 时，才序列化请求消息用于兜底估算（避免每次响应都全量重序列化）
+- 请求侧 token 估算只在真正需要时计算（后端省略 `usage`，或流式响应开始），且剔除 base64 数据以免图片扭曲估算
 
 ### 2.5 配置（`src/config.js`）
 
@@ -154,15 +155,15 @@ POST /v1/chat/completions
 
 | 文件 | 覆盖 |
 |---|---|
-| `test/mappers.test.js` | 请求映射全路径：system 合并/提升、文本/图片/文档块、tool_result 展开与顺序、assistant tool_use、thinking 丢弃、工具过滤、uri format 剥离、tool_choice 四种形态、模型路由、采样参数、输入校验、响应映射与 usage 兜底 |
-| `test/stream.test.js` | SSEParser 分块断行/注释/CRLF/多行 data；翻译器：文本流事件序列、工具流增量、并行工具索引、三类交错、thinking 块与签名、usage 捕获、空流、中途 error、幂等性、畸形 JSON 容错 |
-| `test/integration.test.js` | 真实 HTTP 端到端：假 OpenAI 上游 + 真代理，验证转发 payload 结构、Authorization 头、流式/非流式响应、错误转换、count_tokens、health |
+| `test/mappers.test.js` | 请求映射全路径：system 合并/提升、文本/图片/文档块、tool_result 展开/顺序与 `is_error` 上报、assistant tool_use、thinking 丢弃、工具过滤、uri format 剥离、tool_choice 四种形态及悬空引用「丢弃 + warn」、模型路由、采样参数、输入校验、响应映射、`estimateRequestTokens`（base64 剔除、图片固定计费） |
+| `test/stream.test.js` | SSEParser 分块断行/注释/CRLF/多行 data；翻译器：文本流事件序列、工具流增量、并行工具索引、三类交错、thinking 块与签名、usage 捕获、`message_start`/`message_delta` 的输入 token 估算、空流、中途 error、幂等性、畸形 JSON 容错 |
+| `test/integration.test.js` | 真实 HTTP 端到端：假 OpenAI 上游 + 真代理，验证转发 payload 结构、Authorization 头、流式/非流式响应、错误转换、count_tokens（含 base64 图片不按文本计数）、health、**客户端断连取消**（客户端挂断后上游连接立即关闭）、**不活动超时语义**（慢速但持续的下载熬过总超时时长） |
 | `test/config.test.js` | 三级配置优先级、默认值、参数解析 |
 
-运行：`npm test`（Node ≥ 18 内置 test runner，无额外依赖）。
+运行：`npm test`（Node ≥ 18 内置 test runner，无额外依赖）。共 116 个测试。
 
 ## 4. 扩展指南
 
 - **新增 Anthropic 块类型**：在 `convertMessage` 中处理请求侧；在 `AnthropicStreamTranslator.handleChunk` 中处理流式侧（记得在块切换状态机中登记新类型）
 - **对接新后端**：只要暴露 OpenAI 兼容 `/chat/completions` 即可直接 `--base-url` 接入；若后端对未知字段严格，设 `DISABLE_STREAM_USAGE=1` 与 `DISABLE_TOP_K=1`
-- **精确 token 计数**：`count_tokens` 当前为估算，可替换为 tiktoken/wasm 分词器
+- **精确 token 计数**：`count_tokens` 当前为估算（`mappers.js` 中的 `estimateRequestTokens`，图片单价常量 `IMAGE_TOKEN_ESTIMATE = 1600`），可替换为 tiktoken/wasm 分词器

@@ -21,13 +21,16 @@ export class SSEParser {
 
   // Feed a raw text chunk; returns an array of {event, data} records for
   // every complete SSE event found so far.
+  // Scans with an index pointer and only re-slices the leftover tail once,
+  // so a batch of k lines in an n-byte buffer costs O(n) instead of O(k·n).
   feed(text) {
     const events = []
     this.buffer += text
+    let start = 0
     let newlineIdx
-    while ((newlineIdx = this.buffer.indexOf('\n')) !== -1) {
-      const line = this.buffer.slice(0, newlineIdx).replace(/\r$/, '')
-      this.buffer = this.buffer.slice(newlineIdx + 1)
+    while ((newlineIdx = this.buffer.indexOf('\n', start)) !== -1) {
+      const line = this.buffer.slice(start, newlineIdx).replace(/\r$/, '')
+      start = newlineIdx + 1
 
       if (line === '') {
         // Blank line terminates the current event.
@@ -54,6 +57,7 @@ export class SSEParser {
       }
       // `id:` / `retry:` fields are irrelevant here.
     }
+    if (start > 0) this.buffer = this.buffer.slice(start)
     return events
   }
 }
@@ -65,10 +69,14 @@ export class SSEParser {
 export class AnthropicStreamTranslator {
   // write(event, dataObject) is called once per Anthropic SSE event.
   // model is the upstream model name reported back to the client.
-  constructor({ write, model, messageId = `msg_${randomId()}` }) {
+  // inputTokens is a request-side estimate reported in message_start and
+  // used as the usage fallback (the real API reports input tokens up front;
+  // we only know the real number if the backend sends a usage chunk).
+  constructor({ write, model, messageId = `msg_${randomId()}`, inputTokens = 0 }) {
     this.write = write
     this.model = model
     this.messageId = messageId
+    this.inputTokens = inputTokens
     this.parser = new SSEParser()
 
     this.nextIndex = 0 // next fresh content-block index
@@ -96,7 +104,7 @@ export class AnthropicStreamTranslator {
         content: [],
         stop_reason: null,
         stop_sequence: null,
-        usage: { input_tokens: 0, output_tokens: 0 },
+        usage: { input_tokens: this.inputTokens, output_tokens: 0 },
       },
     })
     this.write('ping', { type: 'ping' })
@@ -257,7 +265,10 @@ export class AnthropicStreamTranslator {
             input_tokens: this.usage.prompt_tokens ?? 0,
             output_tokens: this.usage.completion_tokens ?? 0,
           }
-        : { output_tokens: estimateTokens(this.accumulatedText) },
+        : {
+            input_tokens: this.inputTokens,
+            output_tokens: estimateTokens(this.accumulatedText),
+          },
     })
     this.write('message_stop', { type: 'message_stop' })
     this.ended = true

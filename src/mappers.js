@@ -187,10 +187,15 @@ export function convertMessage(msg) {
     }
     // tool_result blocks become `tool` messages first, preserving order.
     for (const tr of toolResults) {
+      let content = normalizeToolResultContent(tr.content)
+      // Anthropic marks failed tools with `is_error`; OpenAI's `tool` role has
+      // no equivalent flag, so surface it in the text or the model cannot
+      // tell a traceback from a normal result.
+      if (tr.is_error) content = `[error] ${content}`
       out.push({
         role: 'tool',
         tool_call_id: tr.tool_use_id,
-        content: normalizeToolResultContent(tr.content),
+        content,
       })
     }
     if (parts.length > 0) {
@@ -225,7 +230,7 @@ export function convertTools(tools, { filterToolNames = [] } = {}) {
 // Main entry: build the OpenAI chat-completions payload.
 // `models` = { completion, reasoning } — the reasoning model is selected
 // when the Anthropic request enables extended thinking.
-export function anthropicToOpenAI(payload, { models, filterToolNames = [], includeStreamUsage = true, bypassAppDetailMessage = false, includeTopK = true } = {}) {
+export function anthropicToOpenAI(payload, { models, filterToolNames = [], includeStreamUsage = true, bypassAppDetailMessage = false, includeTopK = true, warn } = {}) {
   if (!payload || typeof payload !== 'object') {
     throw badRequest('Request body must be a JSON object')
   }
@@ -292,10 +297,23 @@ export function anthropicToOpenAI(payload, { models, filterToolNames = [], inclu
   }
 
   const tools = convertTools(payload.tools, { filterToolNames })
-  if (tools.length > 0) {
-    openaiPayload.tools = tools
-    const toolChoice = mapToolChoice(payload.tool_choice)
-    if (toolChoice !== undefined) openaiPayload.tool_choice = toolChoice
+  if (tools.length > 0) openaiPayload.tools = tools
+  const toolChoice = mapToolChoice(payload.tool_choice)
+  if (toolChoice !== undefined) {
+    // A forced tool that was filtered out would make the backend reject the
+    // request (or deadlock the client's tool loop); drop the choice and
+    // surface why instead of failing silently. Checked even when no tools
+    // survive filtering, since that is the worst case.
+    if (
+      toolChoice.type === 'function' &&
+      !tools.some((t) => t.function.name === toolChoice.function.name)
+    ) {
+      warn?.(
+        `tool_choice references "${toolChoice.function.name}" which is not in the forwarded tool list (filtered out?); dropping tool_choice`,
+      )
+    } else if (tools.length > 0) {
+      openaiPayload.tool_choice = toolChoice
+    }
   }
 
   if (openaiPayload.stream && includeStreamUsage) {
@@ -326,10 +344,10 @@ export function mapStopReason(finishReason, sawToolCall = false) {
   }
 }
 
-// `inputText` is used only for the token estimate when the backend omits
-// usage info (the server passes the serialized request messages lazily).
+// `inputTokens` is used only for the token estimate when the backend omits
+// usage info (the server passes the request-side estimate lazily).
 // `options.warn` receives non-fatal diagnostics (e.g. malformed tool args).
-export function openaiToAnthropic(data, model, inputText = '', { warn } = {}) {
+export function openaiToAnthropic(data, model, { inputTokens = 0, warn } = {}) {
   const choice = data?.choices?.[0]
   if (!choice) {
     throw httpError('Upstream response contains no choices', 502, 'api_error')
@@ -356,8 +374,11 @@ export function openaiToAnthropic(data, model, inputText = '', { warn } = {}) {
     })
   }
 
-  const messageId = data.id
-    ? String(data.id).replace(/^chatcmpl-?/, 'msg_')
+  const rawId = data.id ? String(data.id) : null
+  const id = rawId
+    ? rawId.startsWith('msg_')
+      ? rawId
+      : `msg_${rawId.replace(/^chatcmpl-?/, '')}`
     : `msg_${randomId()}`
 
   const usage = data.usage
@@ -366,12 +387,12 @@ export function openaiToAnthropic(data, model, inputText = '', { warn } = {}) {
         output_tokens: data.usage.completion_tokens ?? 0,
       }
     : {
-        input_tokens: estimateTokens(inputText),
+        input_tokens: inputTokens,
         output_tokens: estimateTokens(openaiMessage.content ?? ''),
       }
 
   return {
-    id: messageId.startsWith('msg_') ? messageId : `msg_${messageId}`,
+    id,
     type: 'message',
     role: 'assistant',
     model,
@@ -397,6 +418,47 @@ export function estimateTokens(text) {
     if (isCJKCodePoint(ch.codePointAt(0))) cjk++
   }
   return Math.max(1, cjk + Math.ceil((total - cjk) / 4))
+}
+
+// Anthropic's own published estimate for one image in the context window.
+// Used by count_tokens so a base64 screenshot is not counted as ~340k
+// tokens of base64 text (which would trigger premature auto-compaction).
+export const IMAGE_TOKEN_ESTIMATE = 1600
+
+// Estimate the input tokens of a full Anthropic request: text is estimated
+// as usual, but base64 payloads are stripped and images are charged a
+// fixed per-image cost instead of their encoded size.
+export function estimateRequestTokens(payload) {
+  const stripBase64 = (v) => {
+    if (Array.isArray(v)) return v.map(stripBase64)
+    if (v && typeof v === 'object') {
+      const out = {}
+      for (const [k, val] of Object.entries(v)) {
+        if (k === 'data' && typeof val === 'string' && val.length > 64) out[k] = ''
+        else out[k] = stripBase64(val)
+      }
+      return out
+    }
+    return v
+  }
+  const countImages = (v) => {
+    if (Array.isArray(v)) return v.reduce((n, x) => n + countImages(x), 0)
+    if (v && typeof v === 'object') {
+      let n = v.type === 'image' ? 1 : 0
+      for (const val of Object.values(v)) n += countImages(val)
+      return n
+    }
+    return 0
+  }
+  const images = countImages(payload?.messages) + countImages(payload?.system)
+  const text = JSON.stringify(
+    stripBase64({
+      system: payload?.system ?? '',
+      messages: payload?.messages ?? [],
+      tools: payload?.tools ?? [],
+    }),
+  )
+  return estimateTokens(text) + images * IMAGE_TOKEN_ESTIMATE
 }
 
 function isCJKCodePoint(c) {
