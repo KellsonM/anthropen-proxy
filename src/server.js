@@ -36,6 +36,33 @@ export function buildServer(config) {
 
   app.get('/health', async () => ({ status: 'ok' }))
 
+  // Claude Code CLI probes the base URL with `HEAD /api/hello` before its
+  // first real request; the real api.anthropic.com answers 200. A 404 here
+  // makes the CLI treat the proxy as unreachable/unauthenticated.
+  // Fastify auto-exposes HEAD for GET routes (exposeHeadRoutes defaults to
+  // true since v4), so registering GET covers both.
+  app.get('/api/hello', async () => ({ message: 'Hello, World!' }))
+
+  // Claude Code probes `GET /v1/models?limit=1000` for model discovery;
+  // the real Anthropic API answers 200 with the model list. Return a single
+  // entry in Anthropic's list format.
+  app.get('/v1/models', async () => {
+    const midnight = new Date()
+    midnight.setHours(0, 0, 0, 0)
+    const data = [{
+      type: 'model',
+      id: 'anthropic-proxy',
+      display_name: config.models.completion,
+      created_at: midnight.toISOString(),
+    }]
+    return {
+      data,
+      has_more: false,
+      first_id: 'anthropic-proxy',
+      last_id: 'anthropic-proxy',
+    }
+  })
+
   app.post('/v1/messages', async (request, reply) => {
     const payload = request.body
     let openaiPayload

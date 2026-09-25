@@ -397,6 +397,19 @@ test('e2e: health endpoint', async () => {
   assert.equal(res.status, 200)
 })
 
+test('e2e: /api/hello preflight probe answers 200 (HEAD and GET)', async () => {
+  const proxy = await startProxy({ baseUrl: 'http://127.0.0.1:1/v1' })
+  cleanups.push(() => proxy.close())
+  // Claude Code CLI sends HEAD /api/hello before its first real request;
+  // a non-200 makes it treat the proxy as unreachable/unauthenticated.
+  const head = await fetch(`${proxy.base}/api/hello`, { method: 'HEAD' })
+  assert.equal(head.status, 200)
+  const get = await fetch(`${proxy.base}/api/hello`)
+  assert.equal(get.status, 200)
+  const body = await get.json()
+  assert.equal(body.message, 'Hello, World!')
+})
+
 // ---------------------------------------------------------------------------
 // robustness: timeout, error shapes, top_k gate, reasoning passthrough
 // ---------------------------------------------------------------------------
