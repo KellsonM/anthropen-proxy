@@ -122,3 +122,27 @@ test('--no-top-k and DISABLE_TOP_K disable top_k forwarding', () => {
   assert.equal(resolveConfig([], { DISABLE_TOP_K: 'true' }).topK, false)
   assert.equal(resolveConfig([], { DISABLE_TOP_K: '0' }).topK, true)
 })
+
+// ---------------------------------------------------------------------------
+// inbound auth key / missing-value flag validation
+// ---------------------------------------------------------------------------
+
+test('inboundKey defaults to null', () => {
+  assert.equal(resolveConfig([], {}).inboundKey, null)
+})
+
+test('--inbound-key and INBOUND_API_KEY configure the inbound key (CLI wins)', () => {
+  assert.equal(resolveConfig(['--inbound-key', 'sekrit'], {}).inboundKey, 'sekrit')
+  assert.equal(resolveConfig([], { INBOUND_API_KEY: 'env-key' }).inboundKey, 'env-key')
+  assert.equal(resolveConfig(['--inbound-key', 'cli'], { INBOUND_API_KEY: 'env' }).inboundKey, 'cli')
+})
+
+test('a value-taking flag with no value errors with exit code 2', () => {
+  for (const flag of ['--host', '--port', '--base-url', '--api-key', '--inbound-key', '--model', '--reasoning-model', '--filter-tools', '--timeout']) {
+    assert.throws(
+      () => resolveConfig([flag], {}),
+      (err) => err.exitCode === 2 && /Missing value/.test(err.message),
+      `${flag} should reject a missing value`,
+    )
+  }
+})

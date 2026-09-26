@@ -373,6 +373,145 @@ test('e2e: invalid request (missing max_tokens) rejected before upstream call', 
 })
 
 // ---------------------------------------------------------------------------
+// robustness: empty upstream body, Fastify-layer error shapes, inbound auth
+// ---------------------------------------------------------------------------
+
+test('e2e: upstream 204 (no body) on a streaming request -> 502, never hangs', async () => {
+  const upstream = await startFakeUpstream((req, res) => {
+    res.writeHead(204)
+    res.end()
+  })
+  cleanups.push(() => upstream.close())
+  const proxy = await startProxy({ baseUrl: upstream.base })
+  cleanups.push(() => proxy.close())
+
+  const res = await fetch(`${proxy.base}/v1/messages`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(anthropicBody({ stream: true })),
+  })
+  assert.equal(res.status, 502)
+  const body = await res.json()
+  assert.equal(body.type, 'error')
+  assert.equal(body.error.type, 'api_error')
+  assert.match(body.error.message, /no response body/)
+})
+
+test('e2e: upstream 204 (no body) on a non-streaming request -> 502', async () => {
+  const upstream = await startFakeUpstream((req, res) => {
+    res.writeHead(204)
+    res.end()
+  })
+  cleanups.push(() => upstream.close())
+  const proxy = await startProxy({ baseUrl: upstream.base })
+  cleanups.push(() => proxy.close())
+
+  const res = await fetch(`${proxy.base}/v1/messages`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(anthropicBody()),
+  })
+  assert.equal(res.status, 502)
+  const body = await res.json()
+  assert.equal(body.type, 'error')
+})
+
+test('e2e: malformed JSON request body -> Anthropic error shape (not FST_ERR_*)', async () => {
+  const proxy = await startProxy({ baseUrl: 'http://127.0.0.1:1/v1' })
+  cleanups.push(() => proxy.close())
+
+  const res = await fetch(`${proxy.base}/v1/messages`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: '{ this is not valid json',
+  })
+  assert.equal(res.status, 400)
+  const body = await res.json()
+  assert.equal(body.type, 'error')
+  assert.equal(body.error.type, 'invalid_request_error')
+  assert.ok(!('code' in body) || !String(body.code ?? '').startsWith('FST_'))
+})
+
+test('e2e: unknown route -> Anthropic 404 shape', async () => {
+  const proxy = await startProxy({ baseUrl: 'http://127.0.0.1:1/v1' })
+  cleanups.push(() => proxy.close())
+
+  const res = await fetch(`${proxy.base}/nope`)
+  assert.equal(res.status, 404)
+  const body = await res.json()
+  assert.equal(body.type, 'error')
+  assert.equal(body.error.type, 'not_found_error')
+})
+
+test('e2e: inbound auth required -> 401 without key, 200 with x-api-key / Bearer', async () => {
+  const upstream = await startFakeUpstream((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({ choices: [{ message: { content: 'ok' }, finish_reason: 'stop' }] }))
+  })
+  cleanups.push(() => upstream.close())
+  const proxy = await startProxy({ baseUrl: upstream.base, inboundKey: 'sekrit' })
+  cleanups.push(() => proxy.close())
+
+  const noKey = await fetch(`${proxy.base}/v1/messages`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(anthropicBody()),
+  })
+  assert.equal(noKey.status, 401)
+  const noKeyBody = await noKey.json()
+  assert.equal(noKeyBody.error.type, 'authentication_error')
+
+  const wrongKey = await fetch(`${proxy.base}/v1/messages`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-api-key': 'wrong' },
+    body: JSON.stringify(anthropicBody()),
+  })
+  assert.equal(wrongKey.status, 401)
+
+  const withHeader = await fetch(`${proxy.base}/v1/messages`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-api-key': 'sekrit' },
+    body: JSON.stringify(anthropicBody()),
+  })
+  assert.equal(withHeader.status, 200)
+
+  const withBearer = await fetch(`${proxy.base}/v1/messages`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer sekrit' },
+    body: JSON.stringify(anthropicBody()),
+  })
+  assert.equal(withBearer.status, 200)
+
+  // Health stays open even with inbound auth enabled.
+  const health = await fetch(`${proxy.base}/health`)
+  assert.equal(health.status, 200)
+})
+
+test('e2e: stop_sequence backfilled in non-streaming response', async () => {
+  const upstream = await startFakeUpstream((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    res.end(
+      JSON.stringify({
+        choices: [{ message: { role: 'assistant', content: 'the answer is 42STOP' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 2, completion_tokens: 3 },
+      }),
+    )
+  })
+  cleanups.push(() => upstream.close())
+  const proxy = await startProxy({ baseUrl: upstream.base })
+  cleanups.push(() => proxy.close())
+
+  const res = await fetch(`${proxy.base}/v1/messages`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(anthropicBody({ stop_sequences: ['STOP'] })),
+  })
+  const body = await res.json()
+  assert.equal(body.stop_reason, 'end_turn')
+  assert.equal(body.stop_sequence, 'STOP')
+})
+
+// ---------------------------------------------------------------------------
 // auxiliary endpoints
 // ---------------------------------------------------------------------------
 

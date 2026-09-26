@@ -7,12 +7,13 @@
 ## 功能特性
 
 - **完整协议转换**：system 消息、多模态内容（文本/图片）、工具调用（tool_use / tool_result）、stop_sequences、采样参数等
-- **流式 SSE 转换**：OpenAI chunk 流 → Anthropic 事件流（`message_start` / `content_block_*` / `message_delta` / `message_stop`），正确处理文本、思考（thinking）、工具调用的块索引切换与交错
+- **流式 SSE 转换**：OpenAI chunk 流 → Anthropic 事件流（`message_start` / `content_block_*` / `message_delta` / `message_stop`）。文本与思考实时流式；工具调用参数缓冲后在流末作为完整块发出，使工具调用与其他内容交错时绝不会产生非法的「块 stop 后再发 delta」序列
 - **思考模型路由**：请求带 `thinking` 时自动切换到 reasoning 模型，`reasoning` / `reasoning_content` 增量映射为 Anthropic `thinking_delta`
-- **错误转换**：上游错误映射为 Anthropic 标准错误格式（`authentication_error` / `rate_limit_error` / `api_error` 等）
+- **错误转换**：所有错误——上游错误**以及** Fastify 自身错误（请求体 JSON 畸形、404、413 等）——均映射为 Anthropic 标准错误格式（`invalid_request_error` / `authentication_error` / `rate_limit_error` / `api_error` 等）
+- **可选入站认证**：设置 `--inbound-key` / `INBOUND_API_KEY` 后，每个请求必须通过 `x-api-key` 或 `Authorization: Bearer` 携带该 key，否则返回 401（常量时间比较）
 - **辅助端点**：`/v1/messages/count_tokens`（估算 token；base64 图片按每张固定约 1600 token 计，而非按编码后的字符数）、`/health`
-- **健壮的流式处理**：流式与非流式路径均为真不活动超时、慢客户端 drain 背压、客户端中途断连时立即取消上游生成
-- **116 个自动化测试**：单元测试 + 端到端集成测试（`npm test`）
+- **健壮的流式处理**：流式与非流式路径均为真不活动超时、慢客户端 drain 背压、客户端中途断连时立即取消上游生成、SIGINT/SIGTERM 优雅停机
+- **133 个自动化测试**：单元测试 + 端到端集成测试（`npm test`）
 
 ## 安装
 
@@ -20,7 +21,7 @@
 npm install
 ```
 
-要求 Node.js ≥ 18（推荐 20+）。
+要求 Node.js ≥ 20（Fastify 5 及其依赖要求 20+）。
 
 ## 快速开始
 
@@ -70,6 +71,7 @@ claude
 | `--port` | `PORT` | `3000` | 监听端口 |
 | `--base-url` | `ANTHROPIC_PROXY_BASE_URL` | `http://localhost:11434/v1` | OpenAI 兼容后端 base URL（不含 `/chat/completions`） |
 | `--api-key` | `OPENROUTER_API_KEY` / `ANTHROPIC_PROXY_API_KEY` | 无 | 后端 Bearer key，不设置则不发送 Authorization 头 |
+| `--inbound-key` | `INBOUND_API_KEY` | 无 | 设置后，每个请求必须通过 `x-api-key` 或 `Authorization: Bearer` 携带该 key，否则返回 401（`/health` 与 `/api/hello` 探测保持开放）。绑定非 loopback 地址时建议启用 |
 | `--model`（别名 `--completion-model`） | `COMPLETION_MODEL` / `MODEL` | `qwen2.5-coder:7b` | 普通请求使用的模型 |
 | `--reasoning-model` | `REASONING_MODEL` | 同 `--model` | 请求带 `thinking` 时使用的模型 |
 | `--filter-tools` | `FILTER_TOOLS` | `BatchTool` | 逗号分隔，转发前丢弃的工具名 |
@@ -108,7 +110,7 @@ curl -s http://127.0.0.1:3000/v1/messages/count_tokens \
 npm test
 ```
 
-覆盖：请求映射（system 合并、消息角色转换、工具/工具结果含 `is_error` 上报、采样参数、模型路由、校验）、SSE 解析（分块断行、注释、CRLF）、流式块索引管理（文本/思考/工具交错）、错误转换、请求侧 token 估算（base64 剔除、图片固定计费）、端到端集成（真实 HTTP + 假上游，含客户端断连取消与不活动超时语义）。
+覆盖：请求映射（system 合并、消息角色转换、工具/工具结果含 `is_error` 上报、采样参数、模型路由、校验）、SSE 解析（分块断行、注释、CRLF 与裸 `\r`）、流式块索引管理与**块不可变不变量**（每个索引恰好 stop 一次、stop 之后不再有 delta）、错误转换（含 Fastify 层错误）、请求侧 token 估算（base64 剔除、图片固定计费、正则快速路径与参考算法逐字节等价）、入站认证、端到端集成（真实 HTTP + 假上游，含客户端断连取消、空响应体处理与不活动超时语义）。
 
 ## 已知限制
 
@@ -116,6 +118,9 @@ npm test
 - `document`（PDF）内容块以占位符 `[document: ...]` 代替（OpenAI 协议无对应能力）
 - 思考块的 `signature` 为空字符串（本地模型无签名能力，不影响 Claude Code 显示）
 - token 计数为估算值（CJK 约 1 字/token、其余约 4 字符/token；图片按每张固定 1600 token 计），非精确分词
-- 流式下 tool 调用参数被其他内容（如 reasoning）打断后恢复时，会复用原块索引继续发 delta；严格遵循「块 stop 后不可重开」的客户端可能报错，多数实际客户端可容忍（详见 TECHNICAL_zh-CN.md §2.3）
+- **工具调用不再逐字增量流式。** 工具调用参数会被缓冲，在流结束时作为完整 `tool_use` 块发出。这是有意为之：内容块一旦 stop 即不可变，若交错文本后再恢复工具调用，就只能对已 stop 的索引发非法 delta。文本与思考仍实时流式（详见 TECHNICAL_zh-CN.md §2.3）
+- `stop_sequence` 为尽力回填：OpenAI 兼容后端通常会把命中的停止串从返回文本中剥离，因此仅在后端保留该串时才会上报
+- 部分 Anthropic 字段因本地 OpenAI 兼容后端无对应能力而被忽略：`metadata`、`service_tier`、`tool_choice.disable_parallel_tool_use`
+- **生产环境请勿开启 `--debug` / `DEBUG=1`。** 调试日志会把完整的请求/响应 payload（即全部对话内容）写入日志
 
 详细协议映射规则见 [TECHNICAL_zh-CN.md](./TECHNICAL_zh-CN.md)。

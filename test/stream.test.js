@@ -54,6 +54,38 @@ test('SSEParser: CRLF line endings', () => {
   assert.equal(events[0].data, '1')
 })
 
+test('SSEParser: bare CR line endings (SSE spec allows \\r)', () => {
+  const p = new SSEParser()
+  // A trailing lone \r is held by feed() (it could start a \r\n pair);
+  // flush() at end of stream resolves it as a terminator.
+  const held = p.feed('event: ping\rdata: {"a":1}\r\r')
+  assert.equal(held.length, 0)
+  const events = p.flush()
+  assert.equal(events.length, 1)
+  assert.equal(events[0].event, 'ping')
+  assert.deepEqual(JSON.parse(events[0].data), { a: 1 })
+})
+
+test('SSEParser: bare CR events resolve as more bytes arrive', () => {
+  const p = new SSEParser()
+  // The first event's blank line (\r\r) is followed by more bytes, so it
+  // emits immediately; only the trailing \r of the next line is held.
+  const e1 = p.feed('event: a\rdata: 1\r\revent: b\r')
+  assert.equal(e1.length, 1)
+  assert.equal(e1[0].event, 'a')
+  assert.equal(e1[0].data, '1')
+})
+
+test('SSEParser: trailing lone CR waits for next chunk before terminating', () => {
+  const p = new SSEParser()
+  // A trailing \r may be the first half of \r\n; it must not split the
+  // following line until the next byte arrives.
+  assert.deepEqual(p.feed('data: x\r'), [])
+  const events = p.feed('\n\r\n')
+  assert.equal(events.length, 1)
+  assert.equal(events[0].data, 'x')
+})
+
 // ---------------------------------------------------------------------------
 // AnthropicStreamTranslator helpers
 // ---------------------------------------------------------------------------
@@ -72,6 +104,26 @@ const chunk = (delta, finish = null) =>
   `data: ${JSON.stringify({ choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`
 
 const eventNames = (events) => events.map((e) => e.event)
+
+// Anthropic protocol invariant: a content block is immutable once stopped.
+// Every index must be stopped exactly once, and no delta may arrive for an
+// index after its stop. This is the check the old tests lacked, which let
+// the double-stop / delta-after-stop bug slip through.
+function assertBlockProtocol(events) {
+  const stopped = new Set()
+  for (const e of events) {
+    if (e.event === 'content_block_delta') {
+      assert.ok(
+        !stopped.has(e.data.index),
+        `delta emitted after stop on index ${e.data.index}`,
+      )
+    }
+    if (e.event === 'content_block_stop') {
+      assert.ok(!stopped.has(e.data.index), `index ${e.data.index} stopped twice`)
+      stopped.add(e.data.index)
+    }
+  }
+}
 
 // ---------------------------------------------------------------------------
 // translator: text stream
@@ -156,13 +208,14 @@ test('two parallel tool calls get sequential block indices', () => {
   assert.deepEqual(starts.map((s) => s.data.content_block.name), ['f1', 'f2'])
   const stops = events.filter((e) => e.event === 'content_block_stop').map((s) => s.data.index)
   assert.deepEqual(stops, [0, 1])
+  assertBlockProtocol(events)
 })
 
 // ---------------------------------------------------------------------------
 // translator: interleaved content kinds
 // ---------------------------------------------------------------------------
 
-test('text -> tool -> text opens three sequential blocks', () => {
+test('text -> tool -> text: text streams live, tool flushes as a whole block at the end', () => {
   const { t, events } = makeTranslator()
   t.start()
   t.push(chunk({ content: 'before' }))
@@ -171,18 +224,23 @@ test('text -> tool -> text opens three sequential blocks', () => {
   t.push(chunk({}, 'stop'))
   t.push('data: [DONE]\n\n')
 
+  // 'before' and 'after' continue the same live text block (index 0);
+  // the buffered tool call flushes as block 1 at finish.
   const starts = events.filter((e) => e.event === 'content_block_start')
   assert.deepEqual(starts.map((s) => [s.data.index, s.data.content_block.type]), [
     [0, 'text'],
     [1, 'tool_use'],
-    [2, 'text'],
   ])
-  // The tool block must not be closed twice and the final stop closes block 2.
+  const textDeltas = events
+    .filter((e) => e.event === 'content_block_delta' && e.data.delta.type === 'text_delta')
+    .map((e) => e.data.delta.text)
+  assert.deepEqual(textDeltas, ['before', 'after'])
   const stops = events.filter((e) => e.event === 'content_block_stop').map((s) => s.data.index)
-  assert.deepEqual(stops, [0, 1, 2])
+  assert.deepEqual(stops, [0, 1])
+  assertBlockProtocol(events)
 })
 
-test('tool call resuming after other content reuses its block without new start', () => {
+test('tool call resuming after other content: protocol-safe (args buffered, one stop per index)', () => {
   const { t, events } = makeTranslator()
   t.start()
   t.push(chunk({ tool_calls: [{ index: 0, id: 'c1', function: { name: 'f', arguments: '{"a' } }] }))
@@ -190,12 +248,19 @@ test('tool call resuming after other content reuses its block without new start'
   t.push(chunk({ tool_calls: [{ index: 0, function: { arguments: '":1}' } }] }))
   t.push('data: [DONE]\n\n')
 
+  // The interleaved text becomes the live block 0; the tool call flushes
+  // as block 1 with its full arguments — never as a delta into a
+  // previously-stopped index.
   const starts = events.filter((e) => e.event === 'content_block_start')
-  assert.deepEqual(starts.map((s) => s.data.content_block.type), ['tool_use', 'text'])
+  assert.deepEqual(starts.map((s) => s.data.content_block.type), ['text', 'tool_use'])
   const toolDeltas = events
     .filter((e) => e.event === 'content_block_delta' && e.data.delta.type === 'input_json_delta')
     .map((e) => e.data.delta.partial_json)
   assert.equal(toolDeltas.join(''), '{"a":1}')
+  // The tool block is stopped exactly once, after all its deltas.
+  const stops = events.filter((e) => e.event === 'content_block_stop').map((s) => s.data.index)
+  assert.deepEqual(stops, [0, 1])
+  assertBlockProtocol(events)
 })
 
 // ---------------------------------------------------------------------------
@@ -365,4 +430,56 @@ test('real usage chunk overrides the input estimate in message_delta', () => {
   t.push('data: [DONE]\n\n')
   const md = events.find((e) => e.event === 'message_delta')
   assert.deepEqual(md.data.usage, { input_tokens: 5, output_tokens: 2 })
+})
+
+// ---------------------------------------------------------------------------
+// translator: stop_sequence backfill
+// ---------------------------------------------------------------------------
+
+test('stop_sequence backfilled when streamed text ends with a requested stop', () => {
+  const events = []
+  const t = new AnthropicStreamTranslator({
+    model: 'test/model',
+    messageId: 'msg_test',
+    stopSequences: ['END', 'STOP'],
+    write: (event, data) => events.push({ event, data }),
+  })
+  t.start()
+  t.push(chunk({ content: 'hello wor' }))
+  t.push(chunk({ content: 'ldEND' }))
+  t.push(chunk({}, 'stop'))
+  t.push('data: [DONE]\n\n')
+  const md = events.find((e) => e.event === 'message_delta')
+  assert.equal(md.data.delta.stop_sequence, 'END')
+})
+
+test('stop_sequence stays null when no requested stop is matched', () => {
+  const events = []
+  const t = new AnthropicStreamTranslator({
+    model: 'test/model',
+    messageId: 'msg_test',
+    stopSequences: ['ZZZ'],
+    write: (event, data) => events.push({ event, data }),
+  })
+  t.start()
+  t.push(chunk({ content: 'plain ending' }))
+  t.push(chunk({}, 'stop'))
+  t.push('data: [DONE]\n\n')
+  const md = events.find((e) => e.event === 'message_delta')
+  assert.equal(md.data.delta.stop_sequence, null)
+})
+
+test('stop_sequence not reported for non-stop finish reasons', () => {
+  const events = []
+  const t = new AnthropicStreamTranslator({
+    model: 'test/model',
+    messageId: 'msg_test',
+    stopSequences: ['END'],
+    write: (event, data) => events.push({ event, data }),
+  })
+  t.start()
+  t.push(chunk({ content: 'truncatedEND' }, 'length'))
+  t.push('data: [DONE]\n\n')
+  const md = events.find((e) => e.event === 'message_delta')
+  assert.equal(md.data.delta.stop_sequence, null)
 })

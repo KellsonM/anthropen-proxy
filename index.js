@@ -34,6 +34,7 @@ const start = async () => {
     console.log(`  model:    ${config.models.completion}`)
     console.log(`  reasoning: ${config.models.reasoning}`)
     console.log(`  timeout:  ${config.timeout / 1000}s (upstream inactivity)`)
+    if (config.inboundKey) console.log('  inbound auth: REQUIRED (x-api-key / Authorization: Bearer)')
     if (config.filterTools.length) console.log(`  filtered tools: ${config.filterTools.join(', ')}`)
     if (config.bypassAppDetailMessage) console.log('  bypass: dropping <application_details> system messages')
   } catch (err) {
@@ -41,5 +42,25 @@ const start = async () => {
     process.exit(1)
   }
 }
+
+// Graceful shutdown: stop accepting new connections and let in-flight
+// requests finish. Hijacked streaming replies are not tracked by Fastify's
+// idle accounting, so a hard cap force-exits if a long stream lingers.
+let shuttingDown = false
+const shutdown = (signal) => {
+  if (shuttingDown) return
+  shuttingDown = true
+  console.log(`\n${signal} received — shutting down (active streams get 5s to finish)...`)
+  const force = setTimeout(() => process.exit(0), 5000)
+  app
+    .close()
+    .then(() => {
+      clearTimeout(force)
+      process.exit(0)
+    })
+    .catch(() => process.exit(1))
+}
+process.on('SIGINT', () => shutdown('SIGINT'))
+process.on('SIGTERM', () => shutdown('SIGTERM'))
 
 start()

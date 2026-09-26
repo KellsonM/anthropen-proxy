@@ -3,6 +3,50 @@
 All notable changes to this project are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.1.0] - 2026-09-26
+
+### Added
+
+- **Optional inbound authentication**: `--inbound-key` / `INBOUND_API_KEY` requires every request to present the key via `x-api-key` or `Authorization: Bearer` (constant-time comparison); `/health` and the `/api/hello` probe stay open.
+- **Graceful shutdown** on SIGINT/SIGTERM: stop accepting new connections and let in-flight requests finish, with a 5 s cap so Ctrl-C never hangs.
+- **`stop_sequence` backfill** in streaming and non-streaming responses (best-effort: reported when the returned text ends with a requested stop sequence).
+
+### Fixed
+
+- **Streaming protocol violation on interleaved tool calls (critical)**: tool-call argument fragments are now buffered and flushed as complete `tool_use` blocks at stream end. Previously, a tool call interrupted by text and then resumed emitted `input_json_delta` (and a second `content_block_stop`) against an already-stopped block index — illegal per the Anthropic protocol, potentially corrupting tool arguments in strict clients.
+- **HEAD /api/hello route 404**: registered the `GET /api/hello` probe route (Fastify auto-derives HEAD). Claude Code sends `HEAD /api/hello` as a preflight before its first real request; the 404 made the CLI treat the proxy as unreachable/unauthenticated.
+- **Missing `/v1/models` route (404)**: added the model-discovery endpoint returning a single Anthropic-format model entry (`display_name` = configured completion model), so Claude Code's `/model` listing works instead of getting a 404.
+- **Upstream 204 / empty body no longer hangs streaming requests**: `upstream.body` is checked before hijacking the reply; a body-less success now returns a 502 `api_error` instead of leaving the client waiting forever on an empty SSE stream.
+- **Fastify-layer errors now use the Anthropic error shape**: `setErrorHandler` + `setNotFoundHandler` wrap malformed JSON bodies, 404s, and 413s — the raw `FST_ERR_*` format no longer leaks to clients.
+- **Upstream errors inside a 200 body** now preserve the backend's numeric `status`/`code` (mapped to the matching Anthropic error type) instead of flattening everything to 500.
+- **SSEParser bare-`\r` support**: the SSE spec's third line terminator is now handled, with an end-of-stream `flush()` so a bare-CR backend's final event is not lost.
+- **CLI missing-value flags** (e.g. `--base-url` with no value) now exit with code 2 instead of silently falling back to defaults.
+- Removed the dead `raw.flush()` call (no such method exists on `http.ServerResponse`).
+
+### Changed
+
+- `engines` bumped to Node **>= 20** (Fastify 5 and its dependencies require it; `>= 18` was broken on install).
+- Streaming no longer stores the full response text — incremental CJK/total counters plus a short tail for the stop-sequence check.
+
+### Performance
+
+Token estimation now uses a hybrid path: a Latin1 probe skips the scan entirely for pure-ASCII payloads (O(1)), while two-byte strings use a manual UTF-16 code-unit loop — replacing the earlier `u`-flag regex, which regressed on CJK-dense text. Results stay byte-identical to the reference algorithm (guarded by an equivalence test). Benchmarked HEAD vs current on Node v22 (Linux), same mock upstream + real proxy processes:
+
+| Metric | HEAD | Current | Δ |
+|---|---|---|---|
+| estimateTokens — EN 1MB | 10.5 ms | ~0 ms (O(1) skip) | ~∞ |
+| estimateTokens — CJK 1MB | 2.11 ms | 0.83 ms | **2.5× faster** |
+| estimateTokens — Mixed 1MB | 4.71 ms | 2.59 ms | **1.8× faster** |
+| estimateRequestTokens — CJK-heavy 2.8 MB | 9.8 ms | 7.1 ms | **1.4× faster** |
+| estimateRequestTokens — ASCII 2.8 MB | 22.6 ms | 9.3 ms | **2.4× faster** |
+| Stream translate — 8k×60c | 13.4 ms | 10.4 ms | **1.3× faster** |
+| Stream memory (per stream) | O(n) retained | O(1) | **constant** |
+| E2E JSON throughput (conc 20) | 368 req/s | 373 req/s | +1% |
+| E2E JSON p99 | 117 ms | 97 ms | **−17%** |
+| E2E Stream TTFB p99 | 101 ms | 84 ms | **−17%** |
+
+Tests: 116 → **133**, all passing.
+
 ## [1.0.0] - 2026-09-26
 
 ### Fixed
@@ -46,6 +90,50 @@ Benchmarked before/after on Node v22 (Linux), same mock upstream + real proxy pr
 ---
 
 # 更新日志
+
+## [1.1.0] - 2026-09-26
+
+### 新增
+
+- **可选入站认证**:`--inbound-key` / `INBOUND_API_KEY` 要求每个请求通过 `x-api-key` 或 `Authorization: Bearer` 携带该 key(常量时间比较);`/health` 与 `/api/hello` 探测保持开放。
+- **优雅停机**:SIGINT/SIGTERM 触发后停止接受新连接并让进行中的请求收尾,5 秒上限兜底,Ctrl-C 永不卡死。
+- **`stop_sequence` 回填**:流式与非流式响应均尽力回填(返回文本以请求的停止串结尾时上报该串)。
+
+### 修复
+
+- **交错工具调用的流式协议违规(严重)**:tool 调用参数片段改为缓冲,在流末作为完整 `tool_use` 块发出。此前工具调用被文本打断后恢复时,会对已 stop 的块索引继续发 `input_json_delta`(并二次 `content_block_stop`),违反 Anthropic 协议,可能使严格客户端的工具参数损坏。
+- **HEAD /api/hello 路由 404**:注册 `GET /api/hello` 探测路由(Fastify 自动派生 HEAD)。Claude Code 在首个真实请求前会先发 `HEAD /api/hello` 预检,404 会让 CLI 把代理判定为不可达/未认证。
+- **`/v1/models` 路由缺失 404**:新增模型发现端点,返回单条 Anthropic 格式的模型记录(`display_name` 为配置的 completion 模型),Claude Code 的 `/model` 列表不再 404。
+- **上游 204 / 空响应体不再挂起流式请求**:在 hijack 响应之前检查 `upstream.body`,无 body 的成功响应现返回 502 `api_error`,不再让客户端在空 SSE 流上无限等待。
+- **Fastify 层错误改用 Anthropic 错误格式**:`setErrorHandler` + `setNotFoundHandler` 把畸形 JSON 请求体、404、413 全部包装,原始 `FST_ERR_*` 格式不再泄漏给客户端。
+- **200 响应体内的上游错误**现保留后端携带的数值 `status`/`code`(映射为对应 Anthropic 错误类型),不再一律压平成 500。
+- **SSEParser 支持裸 `\r`**:实现 SSE 规范的第三种行终止符,并新增流末 `flush()`,裸 `\r` 后端的最后一个事件不再丢失。
+- **CLI 缺值参数**(如 `--base-url` 后未跟值)现以 exit code 2 报错退出,不再静默回退默认值。
+- 删除 `raw.flush()` 死代码(`http.ServerResponse` 上不存在该方法)。
+
+### 变更
+
+- `engines` 提升至 Node **>= 20**(Fastify 5 及其依赖要求;`>= 18` 安装即坏)。
+- 流式不再存储完整响应文本——改为 CJK/总数增量计数 + 一小段用于停止串检查的文本尾部。
+
+### 性能
+
+Token 估算改为混合路径:Latin1 探测让纯 ASCII 负载直接跳过扫描(O(1)),双字节串走手写 UTF-16 码元循环——替换了此前在 CJK 密集文本上出现回归的 `u` flag 正则。结果与参考算法逐字节一致(有等价性测试守护)。在 Node v22(Linux)上对 HEAD 与当前版做基准测试,同一 mock 上游 + 真实代理进程:
+
+| 指标 | HEAD | 当前版 | 变化 |
+|---|---|---|---|
+| estimateTokens — 英文 1MB | 10.5 ms | ~0 ms(O(1) 跳过) | ~∞ |
+| estimateTokens — 中文 1MB | 2.11 ms | 0.83 ms | **提速 2.5×** |
+| estimateTokens — 混合 1MB | 4.71 ms | 2.59 ms | **提速 1.8×** |
+| estimateRequestTokens — 中文重 2.8MB | 9.8 ms | 7.1 ms | **提速 1.4×** |
+| estimateRequestTokens — 纯 ASCII 2.8MB | 22.6 ms | 9.3 ms | **提速 2.4×** |
+| 流式翻译 — 8k×60c | 13.4 ms | 10.4 ms | **提速 1.3×** |
+| 流式内存(每流) | O(n) 驻留 | O(1) | **恒定** |
+| 端到端 JSON 吞吐(并发 20) | 368 req/s | 373 req/s | +1% |
+| 端到端 JSON p99 | 117 ms | 97 ms | **−17%** |
+| 端到端流式 TTFB p99 | 101 ms | 84 ms | **−17%** |
+
+测试:116 → **133**,全部通过。
 
 ## [1.0.0] - 2026-09-26
 

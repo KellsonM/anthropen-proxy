@@ -629,6 +629,87 @@ test('estimateRequestTokens handles empty/missing payload', () => {
   assert.ok(Number.isFinite(estimateRequestTokens(undefined)))
 })
 
+test('estimateRequestTokens (regex) matches the old deep-copy algorithm exactly', () => {
+  // Reference implementation: the pre-optimization deep-copy strip +
+  // recursive image count + per-code-point estimate. The regex rewrite
+  // must produce byte-identical results across a mixed payload.
+  const oldStrip = (v) => {
+    if (Array.isArray(v)) return v.map(oldStrip)
+    if (v && typeof v === 'object') {
+      const out = {}
+      for (const [k, val] of Object.entries(v)) {
+        if (k === 'data' && typeof val === 'string' && val.length > 64) out[k] = ''
+        else out[k] = oldStrip(val)
+      }
+      return out
+    }
+    return v
+  }
+  const oldCountImages = (v) => {
+    if (Array.isArray(v)) return v.reduce((n, x) => n + oldCountImages(x), 0)
+    if (v && typeof v === 'object') {
+      let n = v.type === 'image' ? 1 : 0
+      for (const val of Object.values(v)) n += oldCountImages(val)
+      return n
+    }
+    return 0
+  }
+  const oldIsCJK = (c) =>
+    (c >= 0x3000 && c <= 0x303f) ||
+    (c >= 0x3040 && c <= 0x30ff) ||
+    (c >= 0x3400 && c <= 0x4dbf) ||
+    (c >= 0x4e00 && c <= 0x9fff) ||
+    (c >= 0xac00 && c <= 0xd7af) ||
+    (c >= 0xf900 && c <= 0xfaff) ||
+    (c >= 0x20000 && c <= 0x2fa1f)
+  const oldEstimate = (text) => {
+    if (!text) return 0
+    let total = 0
+    let cjk = 0
+    for (const ch of String(text)) {
+      total++
+      if (oldIsCJK(ch.codePointAt(0))) cjk++
+    }
+    return Math.max(1, cjk + Math.ceil((total - cjk) / 4))
+  }
+  const oldEstimateRequest = (payload) => {
+    const images = oldCountImages(payload?.messages) + oldCountImages(payload?.system)
+    const text = JSON.stringify(
+      oldStrip({
+        system: payload?.system ?? '',
+        messages: payload?.messages ?? [],
+        tools: payload?.tools ?? [],
+      }),
+    )
+    return oldEstimate(text) + images * IMAGE_TOKEN_ESTIMATE
+  }
+
+  const b64 = 'Q'.repeat(5000)
+  const payload = {
+    system: 'You are a helpful coding assistant. 你是一个编程助手。',
+    messages: [
+      { role: 'user', content: '你好，请解释这段代码 what does this do? 😀' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'text', text: 'Sure, 当然可以。' },
+          { type: 'tool_use', id: 't1', name: 'Read', input: { path: '/tmp/x' } },
+        ],
+      },
+      {
+        role: 'user',
+        content: [
+          { type: 'tool_result', tool_use_id: 't1', content: 'file body 文件内容' },
+          { type: 'image', source: { type: 'base64', media_type: 'image/png', data: b64 } },
+          { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'short' } },
+        ],
+      },
+    ],
+    tools: [{ name: 'Read', description: 'read', input_schema: { type: 'object', properties: { path: { type: 'string' } } } }],
+  }
+  assert.equal(estimateRequestTokens(payload), oldEstimateRequest(payload))
+})
+
 // ---------------------------------------------------------------------------
 // tool_choice dangling reference
 // ---------------------------------------------------------------------------

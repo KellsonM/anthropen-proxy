@@ -17,6 +17,10 @@ Options (env var in parentheses):
                               (ANTHROPIC_PROXY_BASE_URL, default http://localhost:11434/v1)
   --api-key <key>             Backend API key, sent as Bearer token
                               (OPENROUTER_API_KEY / ANTHROPIC_PROXY_API_KEY, optional)
+  --inbound-key <key>         Require clients to present this key (x-api-key or
+                              Authorization: Bearer) to use the proxy;
+                              requests without it get 401
+                              (INBOUND_API_KEY, optional)
   --model <name>              Default model for normal requests
   --completion-model <name>   Alias for --model
                               (COMPLETION_MODEL / MODEL, default qwen2.5-coder:7b)
@@ -45,19 +49,31 @@ export function resolveConfig(argv = [], env = process.env) {
   const flags = {}
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]
-    const take = () => argv[++i]
+    // A flag that expects a value must actually get one: silently falling
+    // back to the default when the user forgot the argument is worse than
+    // failing loudly.
+    const take = (name) => {
+      const v = argv[++i]
+      if (v === undefined) {
+        const err = new Error(`Missing value for ${name}`)
+        err.exitCode = 2
+        throw err
+      }
+      return v
+    }
     switch (arg) {
-      case '--host': flags.host = take(); break
-      case '--port': flags.port = Number(take()); break
-      case '--base-url': flags.baseUrl = take(); break
-      case '--api-key': flags.apiKey = take(); break
-      case '--model': flags.completionModel = take(); break
-      case '--completion-model': flags.completionModel = take(); break
-      case '--reasoning-model': flags.reasoningModel = take(); break
-      case '--filter-tools': flags.filterTools = take(); break
+      case '--host': flags.host = take('--host'); break
+      case '--port': flags.port = Number(take('--port')); break
+      case '--base-url': flags.baseUrl = take('--base-url'); break
+      case '--api-key': flags.apiKey = take('--api-key'); break
+      case '--inbound-key': flags.inboundKey = take('--inbound-key'); break
+      case '--model': flags.completionModel = take('--model'); break
+      case '--completion-model': flags.completionModel = take('--completion-model'); break
+      case '--reasoning-model': flags.reasoningModel = take('--reasoning-model'); break
+      case '--filter-tools': flags.filterTools = take('--filter-tools'); break
       case '--no-stream-usage': flags.streamUsage = false; break
       case '--bypass-app-detail-message': flags.bypassAppDetailMessage = true; break
-      case '--timeout': flags.timeout = Number(take()); break
+      case '--timeout': flags.timeout = Number(take('--timeout')); break
       case '--no-top-k': flags.topK = false; break
       case '--debug': flags.debug = true; break
       case '--help': case '-h': flags.help = true; break
@@ -106,6 +122,7 @@ export function resolveConfig(argv = [], env = process.env) {
     baseUrl: (flags.baseUrl ?? env.ANTHROPIC_PROXY_BASE_URL ?? 'http://localhost:11434/v1')
       .replace(/\/+$/, ''),
     apiKey: flags.apiKey ?? env.ANTHROPIC_PROXY_API_KEY ?? env.OPENROUTER_API_KEY ?? null,
+    inboundKey: flags.inboundKey ?? env.INBOUND_API_KEY ?? null,
     models: { completion: completionModel, reasoning: reasoningModel },
     filterTools,
     streamUsage,
